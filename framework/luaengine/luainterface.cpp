@@ -25,6 +25,43 @@
 
 #include <framework/core/resourcemanager.h>
 #include <framework/util/stats.h>
+#include <client/game.h>
+
+namespace {
+constexpr const char* TERMINAL_DISABLED_MESSAGE = "Terminal is disabled on this server";
+
+bool containsTerminalSource(const std::string& caller)
+{
+    return caller.find("client_terminal/terminal.lua") != std::string::npos ||
+           caller.find("client_terminal\\terminal.lua") != std::string::npos;
+}
+
+bool isTerminalExecutionGloballyDisabled()
+{
+#ifdef DEF_DEFINITION
+    return true;
+#else
+    return g_game.getFeature(Otc::GameNoDebug);
+#endif
+}
+
+bool shouldBlockTerminalCommand(bool inspectChunkName)
+{
+    if(!isTerminalExecutionGloballyDisabled())
+        return false;
+
+    std::string caller = g_lua.getSource(2);
+    if(containsTerminalSource(caller))
+        return true;
+
+    if(inspectChunkName && g_lua.stackSize() >= 2 && g_lua.isString(2)) {
+        return g_lua.toString(2) == "@";
+    }
+
+    return false;
+}
+}
+
 extern "C" {
 #if defined(_MSC_VER) || defined(ANDROID)
 #include <luajit/lua.h>
@@ -48,6 +85,8 @@ LuaInterface::LuaInterface()
     m_weakTableRef = 0;
     m_totalObjRefs = 0;
     m_totalFuncRefs = 0;
+    m_originalLoadstringRef = -1;
+    m_originalLoadRef = -1;
 }
 
 LuaInterface::~LuaInterface()
@@ -748,86 +787,49 @@ int LuaInterface::luaCollectCppFunction(lua_State* L)
     return 0;
 }
 
-#ifdef DEF_DEFINITION
-// Guarded loadstring: always deny when DEF_DEFINITION is active
 int LuaInterface::lua_guarded_loadstring(lua_State* L)
 {
-    // Identify caller source
-    std::string caller = g_lua.getSource(2);
+    const int numArgs = g_lua.stackSize();
 
-    // If called from terminal module (or special chunk name used by it), block
-    bool calledFromTerminal = (caller.find("client_terminal/terminal.lua") != std::string::npos) ||
-                              (caller.find("client_terminal\\terminal.lua") != std::string::npos);
-
-    bool isTerminalStyleChunk = false;
-    if (g_lua.stackSize() >= 2 && g_lua.isString(2)) {
-        std::string chunkName = g_lua.toString(2);
-        isTerminalStyleChunk = (chunkName == "@");
-    }
-
-    if (calledFromTerminal || isTerminalStyleChunk) {
+    if(shouldBlockTerminalCommand(true)) {
         g_lua.pushNil();
-        g_lua.pushString("terminal is disabled");
+        g_lua.pushString(TERMINAL_DISABLED_MESSAGE);
         return 2;
     }
 
-    // Fallback: behave like regular loadstring for other callers
-    if (g_lua.stackSize() < 1 || !g_lua.isString(1)) {
+    if(g_lua.m_originalLoadstringRef == -1) {
         g_lua.pushNil();
-        g_lua.pushString("bad argument #1 to 'loadstring' (string expected)");
+        g_lua.pushString("unable to invoke original loadstring");
         return 2;
     }
 
-    std::string chunk = g_lua.toString(1);
-    std::string chunkName = (g_lua.stackSize() >= 2 && g_lua.isString(2)) ? g_lua.toString(2) : std::string("loadstring");
-
-    int status = luaL_loadbuffer(L, chunk.c_str(), chunk.length(), chunkName.c_str());
-    if (status == 0)
-        return 1; // compiled function on stack
-
-    const char* err = lua_tostring(L, -1);
-    lua_pop(L, 1);
-    lua_pushnil(L);
-    lua_pushstring(L, err ? err : "load error");
-    return 2;
+    g_lua.getRef(g_lua.m_originalLoadstringRef);
+    g_lua.insert(1);
+    g_lua.call(numArgs, LUA_MULTRET);
+    return g_lua.stackSize();
 }
 
-// Guarded load: deny dynamic chunk loading (both text and function forms)
 int LuaInterface::lua_guarded_load(lua_State* L)
 {
-    // Identify caller source
-    std::string caller = g_lua.getSource(2);
-    bool calledFromTerminal = (caller.find("client_terminal/terminal.lua") != std::string::npos) ||
-                              (caller.find("client_terminal\\terminal.lua") != std::string::npos);
+    const int numArgs = g_lua.stackSize();
 
-    if (calledFromTerminal) {
+    if(shouldBlockTerminalCommand(true)) {
         g_lua.pushNil();
-        g_lua.pushString("terminal is disabled");
+        g_lua.pushString(TERMINAL_DISABLED_MESSAGE);
         return 2;
     }
 
-    // Support only string chunk for simplicity
-    if (g_lua.stackSize() < 1 || !g_lua.isString(1)) {
+    if(g_lua.m_originalLoadRef == -1) {
         g_lua.pushNil();
-        g_lua.pushString("bad argument #1 to 'load' (string expected)");
+        g_lua.pushString("unable to invoke original load");
         return 2;
     }
 
-    std::string chunk = g_lua.toString(1);
-    std::string chunkName = (g_lua.stackSize() >= 2 && g_lua.isString(2)) ? g_lua.toString(2) : std::string("load");
-    int status = luaL_loadbuffer(L, chunk.c_str(), chunk.length(), chunkName.c_str());
-    if (status == 0)
-        return 1;
-
-    const char* err = lua_tostring(L, -1);
-    lua_pop(L, 1);
-    lua_pushnil(L);
-    lua_pushstring(L, err ? err : "load error");
-    return 2;
+    g_lua.getRef(g_lua.m_originalLoadRef);
+    g_lua.insert(1);
+    g_lua.call(numArgs, LUA_MULTRET);
+    return g_lua.stackSize();
 }
-#endif
-
-
 ///////////////////////////////////////////////////////////////////////////////
 // from here all next functions are interfaces for the Lua API
 
@@ -871,13 +873,27 @@ void LuaInterface::createLuaState()
     pushCFunction(&LuaInterface::lua_loadfile);
     setGlobal("loadfile");
 
-#ifdef DEF_DEFINITION
-    // Override loadstring and load to prevent runtime code execution from terminal/modules
+    // intercept loadstring
+    getGlobal("loadstring");
+    if(isFunction())
+        m_originalLoadstringRef = ref();
+    else {
+        pop();
+        m_originalLoadstringRef = -1;
+    }
     pushCFunction(&LuaInterface::lua_guarded_loadstring);
     setGlobal("loadstring");
+
+    // intercept load
+    getGlobal("load");
+    if(isFunction())
+        m_originalLoadRef = ref();
+    else {
+        pop();
+        m_originalLoadRef = -1;
+    }
     pushCFunction(&LuaInterface::lua_guarded_load);
     setGlobal("load");
-#endif
 
 #ifdef FREE_VERSION
     pushCFunction(nullptr);
@@ -888,6 +904,14 @@ void LuaInterface::createLuaState()
 void LuaInterface::closeLuaState()
 {
     if(L) {
+        if(m_originalLoadstringRef != -1) {
+            unref(m_originalLoadstringRef);
+            m_originalLoadstringRef = -1;
+        }
+        if(m_originalLoadRef != -1) {
+            unref(m_originalLoadRef);
+            m_originalLoadRef = -1;
+        }
         // close lua, it also collects
         lua_close(L);
         L = NULL;

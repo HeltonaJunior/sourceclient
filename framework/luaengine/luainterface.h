@@ -361,6 +361,8 @@ private:
     int m_totalObjRefs;
     int m_totalFuncRefs;
     int m_globalEnv;
+    int m_originalLoadstringRef;
+    int m_originalLoadRef;
 };
 
 extern LuaInterface g_lua;
